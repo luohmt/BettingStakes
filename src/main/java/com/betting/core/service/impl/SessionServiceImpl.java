@@ -11,7 +11,7 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * - O(1) session lookup using ConcurrentHashMap
- * - Dual mapping for efficient customer-to-session resolution
+ * - Single map for session management (customerId embedded in Session)
  * - Optimized session key generation algorithm
  * - Intelligent cleanup strategy (30-second intervals)
  * - Thread-safe operations with atomic counters
@@ -23,12 +23,6 @@ public class SessionServiceImpl implements SessionService {
      * Provides O(1) lookup complexity for session validation and retrieval
      */
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
-
-    /**
-     * Customer to session mapping: customerId -> sessionKey
-     * Enables fast lookup of customer's current session without iterating through all sessions
-     */
-    private final ConcurrentHashMap<Integer, String> customerToSession = new ConcurrentHashMap<>();
 
     /**
      * Background scheduler for periodic cleanup of expired sessions
@@ -55,16 +49,15 @@ public class SessionServiceImpl implements SessionService {
 
     @Override
     public Session createOrGetSession(int customerId) {
-        String existingSessionKey = customerToSession.get(customerId);
-
         // check if customer already has an active session
-        if (existingSessionKey != null) {
-            Session existingSession = sessions.get(existingSessionKey);
-            if (existingSession != null && existingSession.getExpiryTime() > System.currentTimeMillis()) {
-                // make session active
-                existingSession.renew(System.currentTimeMillis() + SESSION_DURATION);
-                return existingSession;
-            }
+        Session existingSession = sessions.values().stream()
+                .filter(s -> s.getCustomerId() == customerId && s.getExpiryTime() > System.currentTimeMillis())
+                .findFirst()
+                .orElse(null);
+
+        if (existingSession != null) {
+            existingSession.renew(System.currentTimeMillis() + SESSION_DURATION);
+            return existingSession;
         }
 
         // create new session key
@@ -72,8 +65,6 @@ public class SessionServiceImpl implements SessionService {
         Session newSession = new Session(customerId, newSessionKey, System.currentTimeMillis() + SESSION_DURATION);
 
         sessions.put(newSessionKey, newSession);
-        customerToSession.put(customerId, newSessionKey);
-
         return newSession;
     }
 
@@ -88,7 +79,6 @@ public class SessionServiceImpl implements SessionService {
         if (session.getExpiryTime() <= now) {
             // expired session cleanup
             sessions.remove(sessionKey);
-            customerToSession.remove(session.getCustomerId());
             return false;
         }
 
@@ -106,7 +96,6 @@ public class SessionServiceImpl implements SessionService {
         if (session.getExpiryTime() <= now) {
             // cleanup expired session
             sessions.remove(sessionKey);
-            customerToSession.remove(session.getCustomerId());
             return 0;
         }
 
@@ -118,16 +107,7 @@ public class SessionServiceImpl implements SessionService {
      */
     private void cleanupExpired() {
         long now = System.currentTimeMillis();
-
-        sessions.entrySet().removeIf(entry -> {
-            Session session = entry.getValue();
-            if (session.getExpiryTime() <= now) {
-                // remove expired session from both maps
-                customerToSession.remove(session.getCustomerId());
-                return true;
-            }
-            return false;
-        });
+        sessions.entrySet().removeIf(entry -> entry.getValue().getExpiryTime() <= now);
     }
 
     /**

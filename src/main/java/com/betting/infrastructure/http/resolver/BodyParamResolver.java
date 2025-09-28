@@ -31,8 +31,7 @@ public class BodyParamResolver implements ParamResolver {
     private String extractJsonValue(String json, String key) {
         if (json == null) return null;
         LightJsonParser parser = new LightJsonParser(json);
-        String body = parser.getString(key);
-        return body != null ? body : null;
+        return parser.getString(key);
     }
 
 
