@@ -11,52 +11,50 @@ import java.util.concurrent.atomic.AtomicLong;
 
 /**
  * - O(1) session lookup using ConcurrentHashMap
- * - Single map for session management (customerId embedded in Session)
+ * - Single authoritative map: sessionKey -> Session
+ * - Secondary index cache: customerId -> sessionKey (lazy repair if stale)
  * - Optimized session key generation algorithm
  * - Intelligent cleanup strategy (30-second intervals)
  * - Thread-safe operations with atomic counters
  */
 public class SessionServiceImpl implements SessionService {
 
-    /**
-     * Primary session storage: sessionKey -> Session
-     * Provides O(1) lookup complexity for session validation and retrieval
-     */
+    /** 主存：sessionKey -> Session */
     private final ConcurrentHashMap<String, Session> sessions = new ConcurrentHashMap<>();
 
-    /**
-     * Background scheduler for periodic cleanup of expired sessions
-     */
-    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
+    /** 索引缓存：customerId -> sessionKey（懒惰修复，不保证强一致） */
+    private final ConcurrentHashMap<Integer, String> customerIndex = new ConcurrentHashMap<>();
 
-    /**
-     * Atomic counter for generating unique session keys
-     * Ensures thread-safe session key generation
-     */
+    private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor();
     private final AtomicLong sessionCounter = new AtomicLong(0);
 
-    /**
-     * Session duration: 10 minutes in milliseconds
-     * Sessions expire after this duration and are automatically cleaned up
-     */
     private static final long SESSION_DURATION = 10 * 60 * 1000L;
     private static final String CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
 
     public SessionServiceImpl() {
-        // clean up expired sessions every 30 seconds
         scheduler.scheduleAtFixedRate(this::cleanupExpired, 30, 30, TimeUnit.SECONDS);
     }
 
     @Override
     public Session createOrGetSession(int customerId) {
-        // check if customer already has an active session
-        Session existingSession = sessions.values().stream()
+        // 优先走索引缓存
+        String existingSessionKey = customerIndex.get(customerId);
+        Session existingSession = existingSessionKey != null ? sessions.get(existingSessionKey) : null;
+
+        if (existingSession != null && existingSession.getExpiryTime() > System.currentTimeMillis()) {
+            existingSession.renew(System.currentTimeMillis() + SESSION_DURATION);
+            return existingSession;
+        }
+
+        // fallback：从 sessions 扫描一次（修复缓存）
+        existingSession = sessions.values().stream()
                 .filter(s -> s.getCustomerId() == customerId && s.getExpiryTime() > System.currentTimeMillis())
                 .findFirst()
                 .orElse(null);
 
         if (existingSession != null) {
             existingSession.renew(System.currentTimeMillis() + SESSION_DURATION);
+            customerIndex.put(customerId, existingSession.getSessionKey());
             return existingSession;
         }
 
@@ -65,6 +63,8 @@ public class SessionServiceImpl implements SessionService {
         Session newSession = new Session(customerId, newSessionKey, System.currentTimeMillis() + SESSION_DURATION);
 
         sessions.put(newSessionKey, newSession);
+        customerIndex.put(customerId, newSessionKey);
+
         return newSession;
     }
 
@@ -77,11 +77,10 @@ public class SessionServiceImpl implements SessionService {
 
         long now = System.currentTimeMillis();
         if (session.getExpiryTime() <= now) {
-            // expired session cleanup
             sessions.remove(sessionKey);
+            customerIndex.remove(session.getCustomerId(), sessionKey); // 只移除匹配的索引，避免误删
             return false;
         }
-
         return true;
     }
 
@@ -94,8 +93,8 @@ public class SessionServiceImpl implements SessionService {
 
         long now = System.currentTimeMillis();
         if (session.getExpiryTime() <= now) {
-            // cleanup expired session
             sessions.remove(sessionKey);
+            customerIndex.remove(session.getCustomerId(), sessionKey);
             return 0;
         }
 
@@ -107,16 +106,20 @@ public class SessionServiceImpl implements SessionService {
      */
     private void cleanupExpired() {
         long now = System.currentTimeMillis();
-        sessions.entrySet().removeIf(entry -> entry.getValue().getExpiryTime() <= now);
+        sessions.entrySet().removeIf(entry -> {
+            Session session = entry.getValue();
+            if (session.getExpiryTime() <= now) {
+                customerIndex.remove(session.getCustomerId(), entry.getKey());
+                return true;
+            }
+            return false;
+        });
     }
 
-    /**
-     * generate SessionKey
-     * use timestamp + counter to ensure uniqueness
-     */
+    /** 生成 sessionKey */
     private String generateSessionKey() {
-        long timestamp = System.currentTimeMillis() % 1000000; // get last 6 digits
-        long counter = sessionCounter.incrementAndGet() % 1000; //  get 3 digits counter
+        long timestamp = System.currentTimeMillis() % 1000000;
+        long counter = sessionCounter.incrementAndGet() % 1000;
         long combined = timestamp * 1000 + counter;
 
         StringBuilder sb = new StringBuilder(7);
@@ -124,20 +127,13 @@ public class SessionServiceImpl implements SessionService {
             sb.append(CHARS.charAt((int) (combined % CHARS.length())));
             combined /= CHARS.length();
         }
-
         return sb.toString();
     }
 
-    /**
-     * get active session count for monitoring
-     */
     public int getActiveSessionCount() {
         return sessions.size();
     }
 
-    /**
-     * close the scheduler on shutdown
-     */
     public void shutdown() {
         scheduler.shutdown();
         try {
